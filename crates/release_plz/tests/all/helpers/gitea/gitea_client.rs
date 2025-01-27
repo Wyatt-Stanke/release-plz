@@ -36,7 +36,7 @@ impl GiteaContext {
     async fn get_repo(&self, repo_name: &str) -> String {
         let repo: Repository = self
             .client
-            .get(&self.specific_repo_url(repo_name))
+            .get(self.specific_repo_url(repo_name))
             .basic_auth(&self.user.username, Some(&self.user.password))
             .send()
             .await
@@ -66,6 +66,89 @@ impl GiteaContext {
             .await
             .unwrap()
     }
+
+    pub async fn merge_pr_retrying(&self, pr_number: u64) {
+        let max_retries = 20;
+        let mut retries = 0;
+        loop {
+            match self.merge_pr(pr_number).await {
+                Ok(()) => break,
+                Err(e) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    retries += 1;
+                    if retries > max_retries {
+                        panic!("Failed to merge PR after {max_retries} retries. Error: {e:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn merge_pr(&self, pr_number: u64) -> anyhow::Result<()> {
+        let pr_url = format!("{}/merge", self.pull_url(pr_number));
+        self.client
+            .post(&pr_url)
+            .basic_auth(&self.user.username, Some(&self.user.password))
+            // set merge strategy
+            .json(&serde_json::json!({"Do": "squash"}))
+            .send()
+            .await
+            .unwrap()
+            .ok_if_2xx()
+            .await?;
+        Ok(())
+    }
+
+    /// Get the Gitea release associated to the given `tag`.
+    pub async fn get_gitea_release(&self, tag: &str) -> GiteaRelease {
+        let request_path = format!("{}/releases/tags/{}", self.repo_url(), tag);
+        self.client
+            .get(&request_path)
+            .basic_auth(&self.user.username, Some(&self.user.password))
+            .send()
+            .await
+            .unwrap()
+            .ok_if_2xx()
+            .await
+            .unwrap()
+            .json::<GiteaRelease>()
+            .await
+            .unwrap()
+    }
+
+    pub async fn get_file_content(&self, branch: &str, file_path: &str) -> String {
+        use base64::Engine as _;
+        let request_path = format!("{}/contents/{}", self.repo_url(), file_path);
+        let response = self
+            .client
+            .get(&request_path)
+            .basic_auth(&self.user.username, Some(&self.user.password))
+            .query(&[("ref", branch)])
+            .send()
+            .await
+            .unwrap()
+            .ok_if_2xx()
+            .await
+            .unwrap()
+            .json::<Contents>()
+            .await
+            .unwrap();
+        let content = base64::engine::general_purpose::STANDARD
+            .decode(response.content.as_bytes())
+            .unwrap();
+        String::from_utf8(content).unwrap()
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct GiteaRelease {
+    pub name: String,
+    pub body: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct Contents {
+    pub content: String,
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -65,7 +65,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-22.04
           - target: aarch64-apple-darwin
-            os: macos-12
+            os: macos-13
           - target: aarch64-pc-windows-msvc
             os: windows-2022
           - target: x86_64-unknown-linux-gnu
@@ -73,24 +73,24 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-22.04
           - target: x86_64-apple-darwin
-            os: macos-12
+            os: macos-13
           - target: x86_64-pc-windows-msvc
             os: windows-2022
           - target: x86_64-unknown-freebsd
             os: ubuntu-22.04
-          - target: universal-apple-darwin
-            os: macos-12
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/setup-cross-toolchain-action@v1
         with:
           target: ${{ matrix.target }}
         if: startsWith(matrix.os, 'ubuntu') && !contains(matrix.target, '-musl')
-      - uses: taiki-e/install-action@cross
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
         if: contains(matrix.target, '-musl')
       - run: echo "RUSTFLAGS=${RUSTFLAGS} -C target-feature=+crt-static" >> "${GITHUB_ENV}"
         if: endsWith(matrix.target, 'windows-msvc')
@@ -112,5 +112,5 @@ Some projects to consider for this task:
 
 :::caution
 To release a binary after release, the release-plz GitHub Action needs to
-[trigger further workflow runs](../github/trigger.md).
+[trigger further workflow runs](../github/token.md).
 :::

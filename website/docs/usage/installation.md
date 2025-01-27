@@ -1,18 +1,18 @@
 # Installation
 
-Make sure you have `git` and `openssl` installed when running `release-plz`.
+Make sure you have `git` installed when running `release-plz`.
 
 `release-plz` is a rust binary that can be installed in different ways.
 
 ## Download prebuilt binary
 
-The latest release is on [GitHub](https://github.com/MarcoIeni/release-plz/releases/latest).
+The latest release is on [GitHub](https://github.com/release-plz/release-plz/releases/latest).
 
 ## Cargo
 
 * Install the rust toolchain in order to have cargo installed by following
   [this](https://www.rust-lang.org/tools/install) guide.
-* Run `cargo install release-plz --locked`.
+* Run `cargo install --locked release-plz`.
 
 ## Docker
 
@@ -21,7 +21,7 @@ Run `docker pull marcoieni/release-plz`.
 ## Arch Linux
 
 `release-plz` can be installed from the
-[community repository](https://archlinux.org/packages/community/x86_64/release-plz/)
+[community repository](https://archlinux.org/packages/extra/x86_64/release-plz/)
 using [pacman](https://wiki.archlinux.org/title/Pacman).
 
 * `pacman -S release-plz`
@@ -31,3 +31,12 @@ and it can be installed with an [AUR helper](https://wiki.archlinux.org/title/AU
 For example:
 
 * `paru -S release-plz-git`
+
+## Alpine Linux
+
+`release-plz` is available for [Alpine Edge](https://pkgs.alpinelinux.org/packages?name=release-plz&branch=edge).
+
+It can be installed via [apk](https://wiki.alpinelinux.org/wiki/Alpine_Package_Keeper) after
+enabling the [testing repository](https://wiki.alpinelinux.org/wiki/Repositories).
+
+* `apk add release-plz`

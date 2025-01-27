@@ -1,15 +1,17 @@
 [package]
 name = "next_version"
-version = "0.2.5"
-edition = "2021"
+version = "0.2.21"
+edition.workspace = true
 description = "Determine next semantic version based on conventional commits"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/MarcoIeni/release-plz/tree/main/crates/next_version"
+license.workspace = true
+repository = "https://github.com/release-plz/release-plz/tree/main/crates/next_version"
 keywords = ["semver", "semantic", "versioning", "conventional", "commits"]
 categories = ["development-tools", "parsing"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lints]
+workspace = true
 
 [dependencies]
+regex.workspace = true
 semver.workspace = true
 conventional_commit_parser.workspace = true
