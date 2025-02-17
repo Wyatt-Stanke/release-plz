@@ -1,6 +1,7 @@
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
 use anyhow::Context;
+use cargo_metadata::camino::Utf8Path;
 use serde::Deserialize;
 use tracing::debug;
 
@@ -10,8 +11,8 @@ use tracing::debug;
 /// the version of the packages changed.
 /// This is enough to understand if the package was updated.
 pub fn are_lock_dependencies_updated(
-    local_lock: &Path,
-    registry_package: &Path,
+    local_lock: &Utf8Path,
+    registry_package: &Utf8Path,
 ) -> anyhow::Result<bool> {
     let registry_lock = &registry_package.join("Cargo.lock");
     if !local_lock.exists() || !registry_lock.exists() {
@@ -20,14 +21,14 @@ pub fn are_lock_dependencies_updated(
     are_dependencies_updated(local_lock, registry_lock)
 }
 
-fn are_dependencies_updated(local_lock: &Path, registry_lock: &Path) -> anyhow::Result<bool> {
+fn are_dependencies_updated(
+    local_lock: &Utf8Path,
+    registry_lock: &Utf8Path,
+) -> anyhow::Result<bool> {
     let local_lock: Lockfile = read_lockfile(local_lock)
-        .with_context(|| format!("failed to load lockfile of local package {:?}", local_lock))?;
+        .with_context(|| format!("failed to load lockfile of local package {local_lock:?}"))?;
     let registry_lock = read_lockfile(registry_lock).with_context(|| {
-        format!(
-            "failed to load lockfile of registry package {:?}",
-            registry_lock
-        )
+        format!("failed to load lockfile of registry package {registry_lock:?}")
     })?;
     let local_lock_packages = PackagesByName::new(&local_lock.packages);
     Ok(are_dependencies_of_lockfiles_updated(
@@ -36,9 +37,8 @@ fn are_dependencies_updated(local_lock: &Path, registry_lock: &Path) -> anyhow::
     ))
 }
 
-fn read_lockfile(path: &Path) -> anyhow::Result<Lockfile> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("can't read lockfile {path:?}"))?;
+fn read_lockfile(path: &Utf8Path) -> anyhow::Result<Lockfile> {
+    let content = fs_err::read_to_string(path).context("can't read lockfile")?;
     let lockfile =
         toml::from_str(&content).with_context(|| format!("invalid format of lockfile {path:?}"))?;
     Ok(lockfile)
