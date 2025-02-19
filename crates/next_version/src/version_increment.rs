@@ -1,7 +1,8 @@
-use conventional_commit_parser::commit::{CommitType, ConventionalCommit};
+use git_conventional::Commit;
+use regex::Regex;
 use semver::Version;
 
-use crate::NextVersion;
+use crate::{NextVersion, VersionUpdater};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum VersionIncrement {
@@ -9,6 +10,10 @@ pub enum VersionIncrement {
     Minor,
     Patch,
     Prerelease,
+}
+
+fn is_there_a_custom_match(regex: Option<&Regex>, commits: &[Commit]) -> bool {
+    regex.is_some_and(|r| commits.iter().any(|commit| r.is_match(&commit.type_())))
 }
 
 impl VersionIncrement {
@@ -27,20 +32,39 @@ impl VersionIncrement {
         I: IntoIterator,
         I::Item: AsRef<str>,
     {
+        let updater = VersionUpdater::default();
+        Self::from_commits_with_updater(&updater, current_version, commits)
+    }
+
+    pub(crate) fn from_commits_with_updater<I>(
+        updater: &VersionUpdater,
+        current_version: &Version,
+        commits: I,
+    ) -> Option<Self>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
         let mut commits = commits.into_iter().peekable();
         let are_commits_present = commits.peek().is_some();
-        if !are_commits_present {
-            None
-        } else {
+        if are_commits_present {
             if !current_version.pre.is_empty() {
                 return Some(VersionIncrement::Prerelease);
             }
             // Parse commits and keep only the ones that follow conventional commits specification.
-            let commits: Vec<ConventionalCommit> = commits
-                .filter_map(|c| conventional_commit_parser::parse(c.as_ref()).ok())
+            let commit_messages: Vec<String> = commits.map(|c| c.as_ref().to_string()).collect();
+            let commits: Vec<Commit> = commit_messages
+                .iter()
+                .filter_map(|c| Commit::parse(c).ok())
                 .collect();
 
-            Some(Self::from_conventional_commits(current_version, &commits))
+            Some(Self::from_conventional_commits(
+                current_version,
+                &commits,
+                updater,
+            ))
+        } else {
+            None
         }
     }
 
@@ -71,20 +95,35 @@ impl VersionIncrement {
     }
 
     /// If no conventional commits are present, the version is incremented as a Patch
-    fn from_conventional_commits(current: &Version, commits: &[ConventionalCommit]) -> Self {
+    fn from_conventional_commits(
+        current: &Version,
+        commits: &[Commit],
+        updater: &VersionUpdater,
+    ) -> Self {
         let is_there_a_feature = || {
             commits
                 .iter()
-                .any(|commit| commit.commit_type == CommitType::Feature)
+                .any(|commit| commit.type_() == git_conventional::Type::FEAT)
         };
 
-        let is_there_a_breaking_change = || commits.iter().any(|commit| commit.is_breaking_change);
+        let is_there_a_breaking_change = commits.iter().any(|commit| commit.breaking());
 
-        let is_major_bump = || current.major != 0 && is_there_a_breaking_change();
+        let is_major_bump = || {
+            (is_there_a_breaking_change
+                || is_there_a_custom_match(updater.custom_major_increment_regex.as_ref(), commits))
+                && (current.major != 0 || updater.breaking_always_increment_major)
+        };
 
         let is_minor_bump = || {
-            (current.major != 0 && is_there_a_feature())
-                || (current.major == 0 && current.minor != 0 && is_there_a_breaking_change())
+            let is_feat_bump = || {
+                is_there_a_feature()
+                    && (current.major != 0 || updater.features_always_increment_minor)
+            };
+            let is_breaking_bump =
+                || current.major == 0 && current.minor != 0 && is_there_a_breaking_change;
+            is_feat_bump()
+                || is_breaking_bump()
+                || is_there_a_custom_match(updater.custom_minor_increment_regex.as_ref(), commits)
         };
 
         if is_major_bump() {
@@ -105,5 +144,35 @@ impl VersionIncrement {
             Self::Patch => version.increment_patch(),
             Self::Prerelease => version.increment_prerelease(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use regex::Regex;
+
+    #[test]
+    fn returns_true_for_matching_custom_type() {
+        let regex = Regex::new(r"custom").unwrap();
+        let commits = vec![Commit::parse("custom: A custom commit").unwrap()];
+
+        assert!(is_there_a_custom_match(Some(&regex), &commits));
+    }
+
+    #[test]
+    fn returns_false_for_non_custom_commit_types() {
+        let regex = Regex::new(r"custom").unwrap();
+        let commits = vec![Commit::parse("feat: A feature commit").unwrap()];
+
+        assert!(!is_there_a_custom_match(Some(&regex), &commits));
+    }
+
+    #[test]
+    fn returns_false_for_empty_commits_list() {
+        let regex = Regex::new(r"custom").unwrap();
+        let commits: Vec<Commit> = Vec::new();
+
+        assert!(!is_there_a_custom_match(Some(&regex), &commits));
     }
 }

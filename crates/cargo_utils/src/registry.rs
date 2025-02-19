@@ -7,15 +7,22 @@ use url::Url;
 const CRATES_IO_INDEX: &str = "https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_REGISTRY: &str = "crates-io";
 
+/// Read index for a specific registry using environment variables.
+/// <https://doc.rust-lang.org/cargo/reference/environment-variables.html>
+pub fn registry_index_url_from_env(registry: &str) -> Option<String> {
+    let env_var = format!("CARGO_REGISTRIES_{}_INDEX", registry.to_uppercase());
+
+    std::env::var(env_var).ok()
+}
+
 /// Find the URL of a registry
 pub fn registry_url(manifest_path: &Path, registry: Option<&str>) -> anyhow::Result<Url> {
-    // TODO support local registry sources, directory sources, git sources: https://doc.rust-lang.org/cargo/reference/source-replacement.html?highlight=replace-with#source-replacement
     fn read_config(
         registries: &mut HashMap<String, Source>,
         path: impl AsRef<Path>,
     ) -> anyhow::Result<()> {
         // TODO unit test for source replacement
-        let content = std::fs::read_to_string(path)?;
+        let content = fs_err::read_to_string(path).context("failed to read cargo config file")?;
         let config = toml::from_str::<CargoConfig>(&content).context("Invalid cargo config")?;
         for (key, value) in config.registries {
             registries.entry(key).or_insert(Source {
@@ -32,6 +39,19 @@ pub fn registry_url(manifest_path: &Path, registry: Option<&str>) -> anyhow::Res
     // it's looks like a singly linked list
     // put relations in this map.
     let mut registries: HashMap<String, Source> = HashMap::new();
+
+    // set top-level env var override if it exists.
+    if let Some(registry_name) = registry {
+        if let Some(env_var_override) = registry_index_url_from_env(registry_name) {
+            registries
+                .entry(registry_name.to_string())
+                .or_insert(Source {
+                    registry: Some(env_var_override),
+                    replace_with: None,
+                });
+        }
+    }
+
     // ref: https://doc.rust-lang.org/cargo/reference/config.html#hierarchical-structure
     for work_dir in manifest_path
         .parent()
@@ -116,7 +136,7 @@ struct Registry {
     index: Option<String>,
 }
 
-fn cargo_home() -> anyhow::Result<PathBuf> {
+pub fn cargo_home() -> anyhow::Result<PathBuf> {
     let default_cargo_home = dirs::home_dir()
         .map(|x| x.join(".cargo"))
         .context("Failed to read home directory")?;

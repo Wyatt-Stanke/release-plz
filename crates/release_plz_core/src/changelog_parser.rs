@@ -1,7 +1,7 @@
-use std::{fs::read_to_string, path::Path};
-
 use anyhow::Context;
+use cargo_metadata::camino::Utf8Path;
 use regex::Regex;
+use std::sync::LazyLock;
 
 /// Parse the header from a changelog.
 /// The changelog header is a string at the begin of the changelog that:
@@ -9,13 +9,15 @@ use regex::Regex;
 /// - ends with `## Unreleased`, `## [Unreleased]` or `## ..anything..`
 ///   (in the ..anything.. case, `## ..anything..` is not included in the header)
 pub fn parse_header(changelog: &str) -> Option<String> {
-    lazy_static::lazy_static! {
-        static ref FIRST_RE: Regex = Regex::new(r#"(?s)^(# Changelog|# CHANGELOG|# changelog)(.*)(## Unreleased|## \[Unreleased\])"#).unwrap();
+    static FIRST_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)^(# Changelog|# CHANGELOG|# changelog)(.*)(## Unreleased|## \[Unreleased\]|## unreleased|## \[unreleased\])(.*?)(\n)").unwrap()
+    });
+    static SECOND_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)^(# Changelog|# CHANGELOG|# changelog)(.*?)(\n## )").unwrap()
+    });
 
-        static ref SECOND_RE: Regex = Regex::new(r#"(?s)^(# Changelog|# CHANGELOG|# changelog)(.*)(\n## )"#).unwrap();
-    }
     if let Some(captures) = FIRST_RE.captures(changelog) {
-        return Some(format!("{}\n", &captures[0]));
+        return Some(captures[0].to_string());
     }
 
     if let Some(captures) = SECOND_RE.captures(changelog) {
@@ -25,8 +27,8 @@ pub fn parse_header(changelog: &str) -> Option<String> {
     None
 }
 
-pub fn last_changes(changelog: &Path) -> anyhow::Result<Option<String>> {
-    let changelog = read_to_string(changelog).context("can't read changelog file")?;
+pub fn last_changes(changelog: &Utf8Path) -> anyhow::Result<Option<String>> {
+    let changelog = fs_err::read_to_string(changelog).context("can't read changelog file")?;
     last_changes_from_str(&changelog)
 }
 
@@ -128,6 +130,13 @@ My custom changelog header
     }
 
     #[test]
+    fn changelog_header_with_crlf_parsed_will_contain_crlf() {
+        let changelog = "# Changelog\r\n\r\nMy custom changelog header\r\n\r\n## [Unreleased]\r\n";
+        let header = parse_header(changelog).unwrap_or("".to_string());
+        assert_eq!(header, changelog);
+    }
+
+    #[test]
     fn changelog_header_without_unreleased_is_parsed() {
         let changelog = "\
 # Changelog
@@ -135,6 +144,35 @@ My custom changelog header
 My custom changelog header
 
 ## [0.2.5] - 2022-12-16
+
+";
+        let header = parse_header(changelog).unwrap();
+        let expected_header = "\
+# Changelog
+
+My custom changelog header
+";
+        assert_eq!(header, expected_header);
+    }
+
+    #[test]
+    fn changelog_header_without_unreleased_and_two_previous_versions_is_parsed() {
+        let changelog = "\
+# Changelog
+
+My custom changelog header
+
+## [0.2.5] - 2022-12-16
+
+### Added
+
+- Incredible feature
+
+## [0.2.5] - 2022-12-16
+
+### Fixed
+
+- Incredible bug
 ";
         let header = parse_header(changelog).unwrap();
         let expected_header = "\
@@ -193,16 +231,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.5] - 2022-12-16
 
 ### Added
+
 - Add function to retrieve default branch (#372)
 
 ## [0.2.4] - 2022-12-12
 
 ### Changed
+
 - improved error message
 ";
         let changes = last_changes_from_str_test(changelog);
         let expected_changes = "\
 ### Added
+
 - Add function to retrieve default branch (#372)";
         assert_eq!(changes, expected_changes);
     }
@@ -211,24 +252,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fn changelog_without_unreleased_section_is_parsed() {
         let changelog = "\
 # Changelog
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.5](https://github.com/MarcoIeni/release-plz/compare/git_cmd-v0.2.4...git_cmd-v0.2.5) - 2022-12-16
+## [0.2.5](https://github.com/release-plz/release-plz/compare/git_cmd-v0.2.4...git_cmd-v0.2.5) - 2022-12-16
 
 ### Added
+
 - Add function to retrieve default branch (#372)
 
 ## [0.2.4] - 2022-12-12
 
 ### Changed
+
 - improved error message
 ";
         let changes = last_changes_from_str_test(changelog);
         let expected_changes = "\
 ### Added
+
 - Add function to retrieve default branch (#372)";
         assert_eq!(changes, expected_changes);
     }
