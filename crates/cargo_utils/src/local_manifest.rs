@@ -1,13 +1,17 @@
 use std::{
-    env, fs,
+    env,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
 };
 
 use anyhow::Context;
+use cargo_metadata::{
+    Metadata,
+    camino::{Utf8Path, Utf8PathBuf},
+};
 use semver::Version;
 
-use crate::{DepTable, Manifest};
+use crate::{CARGO_TOML, DepTable, Manifest, to_utf8_pathbuf};
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum FeatureStatus {
@@ -20,7 +24,7 @@ enum FeatureStatus {
 #[derive(Debug)]
 pub struct LocalManifest {
     /// Path to the manifest
-    pub path: PathBuf,
+    pub path: Utf8PathBuf,
     /// Manifest contents
     pub manifest: Manifest,
 }
@@ -43,17 +47,17 @@ impl LocalManifest {
     /// Construct a `LocalManifest`. If no path is provided, make an educated guess as to which one
     /// the user means.
     pub fn find(path: Option<&Path>) -> anyhow::Result<Self> {
-        let path = dunce::canonicalize(find(path)?)?;
+        let canonicalized_path = dunce::canonicalize(find(path)?)?;
+        let path = to_utf8_pathbuf(canonicalized_path)?;
         Self::try_new(&path)
     }
 
     /// Construct the `LocalManifest` corresponding to the `Path` provided.
-    pub fn try_new(path: &Path) -> anyhow::Result<Self> {
+    pub fn try_new(path: &Utf8Path) -> anyhow::Result<Self> {
         if !path.is_absolute() {
-            anyhow::bail!("can only edit absolute paths, got {}", path.display());
+            anyhow::bail!("can only edit absolute paths, got {}", path);
         }
-        let data =
-            std::fs::read_to_string(path).with_context(|| "Failed to read manifest contents")?;
+        let data = fs_err::read_to_string(path).context("Failed to read manifest contents")?;
         let manifest = data.parse().context("Unable to parse Cargo.toml")?;
         Ok(LocalManifest {
             manifest,
@@ -66,7 +70,46 @@ impl LocalManifest {
         let s = self.manifest.data.to_string();
         let new_contents_bytes = s.as_bytes();
 
-        std::fs::write(&self.path, new_contents_bytes).context("Failed to write updated Cargo.toml")
+        fs_err::write(&self.path, new_contents_bytes).context("Failed to write updated Cargo.toml")
+    }
+
+    pub fn get_dependency_tables(&self) -> impl Iterator<Item = &dyn toml_edit::TableLike> + '_ {
+        let root = self.data.as_table();
+        root.iter().flat_map(|(key, v)| {
+            if DepTable::KINDS.iter().any(|kind| kind.kind_table() == key) {
+                v.as_table_like().into_iter().collect::<Vec<_>>()
+            } else if key == "workspace" {
+                v.as_table_like()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if k == "dependencies" {
+                            v.as_table_like()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            } else if key == "target" {
+                v.as_table_like()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|(_, v)| {
+                        v.as_table_like().into_iter().flat_map(|v| {
+                            v.iter().filter_map(|(k, v)| {
+                                if DepTable::KINDS.iter().any(|kind| kind.kind_table() == k) {
+                                    v.as_table_like()
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        })
     }
 
     /// Allow mutating depedencies, wherever they live
@@ -123,6 +166,14 @@ impl LocalManifest {
             .get_mut("workspace")?
             .get_mut("dependencies")?
             .as_table_like_mut()
+    }
+
+    /// Iterates over the `[workspace.dependencies]`.
+    pub fn get_workspace_dependency_table(&self) -> Option<&dyn toml_edit::TableLike> {
+        self.data
+            .get("workspace")?
+            .get("dependencies")?
+            .as_table_like()
     }
 
     /// Override the manifest's version
@@ -205,7 +256,7 @@ impl LocalManifest {
 pub fn find(specified: Option<&Path>) -> anyhow::Result<PathBuf> {
     match specified {
         Some(path)
-            if fs::metadata(path)
+            if fs_err::metadata(path)
                 .with_context(|| "Failed to get cargo file metadata")?
                 .is_file() =>
         {
@@ -221,7 +272,7 @@ pub(crate) fn find_manifest_path(dir: &Path) -> anyhow::Result<PathBuf> {
     const MANIFEST_FILENAME: &str = "Cargo.toml";
     for path in dir.ancestors() {
         let manifest = path.join(MANIFEST_FILENAME);
-        if std::fs::metadata(&manifest).is_ok() {
+        if fs_err::metadata(&manifest).is_ok() {
             return Ok(manifest);
         }
     }
@@ -241,13 +292,12 @@ fn remove_feature_activation(
         .filter_map(|(idx, feature_activation)| {
             if let toml_edit::Value::String(feature_activation) = feature_activation {
                 let activation = feature_activation.value();
-                #[allow(clippy::unnecessary_lazy_evaluations)] // requires 1.62
                 match status {
                     FeatureStatus::None => activation == dep || activation.starts_with(dep_feature),
                     FeatureStatus::DepFeature => activation == dep,
                     FeatureStatus::Feature => false,
                 }
-                .then(|| idx)
+                .then_some(idx)
             } else {
                 None
             }
@@ -258,4 +308,17 @@ fn remove_feature_activation(
     for idx in remove_list.iter().rev() {
         feature_activations.remove(*idx);
     }
+}
+
+pub fn workspace_manifest(metadata: &Metadata) -> Utf8PathBuf {
+    metadata.workspace_root.join("Cargo.toml")
+}
+
+pub fn canonical_local_manifest(local_manifest: &Path) -> anyhow::Result<Utf8PathBuf> {
+    let mut local_manifest = dunce::canonicalize(local_manifest)?;
+    if !local_manifest.ends_with(CARGO_TOML) {
+        local_manifest.push(CARGO_TOML);
+    }
+    let local_manifest = to_utf8_pathbuf(local_manifest)?;
+    Ok(local_manifest)
 }

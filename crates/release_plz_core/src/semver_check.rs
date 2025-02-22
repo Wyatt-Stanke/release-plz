@@ -1,17 +1,14 @@
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::process::Command;
 
 use anyhow::Context;
+use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
+use cargo_utils::CARGO_TOML;
 
-use crate::CARGO_TOML;
-
-fn target_dir(path: &Path) -> PathBuf {
+fn target_dir(path: &Utf8Path) -> Utf8PathBuf {
     path.join("target")
 }
 
-fn cargo_lock(path: &Path) -> PathBuf {
+fn cargo_lock(path: &Utf8Path) -> Utf8PathBuf {
     path.join("Cargo.lock")
 }
 
@@ -45,8 +42,8 @@ impl SemverCheck {
 }
 
 pub fn run_semver_check(
-    local_package: &Path,
-    registry_package: &Path,
+    local_package: &Utf8Path,
+    registry_package: &Utf8Path,
 ) -> anyhow::Result<SemverCheck> {
     let local_cargo_lock = cargo_lock(local_package);
     let registry_cargo_lock = cargo_lock(registry_package);
@@ -61,25 +58,25 @@ pub fn run_semver_check(
     let output = Command::new("cargo-semver-checks")
         .args(["semver-checks", "check-release"])
         .arg("--manifest-path")
-        .arg(&local_package.join(CARGO_TOML))
+        .arg(local_package.join(CARGO_TOML))
         .arg("--baseline-root")
-        .arg(&registry_package.join(CARGO_TOML))
+        .arg(registry_package.join(CARGO_TOML))
         .output()
         .with_context(|| format!("error while running cargo-semver-checks on {local_package:?}"))?;
 
     // Delete Cargo.lock file if cargo-semver-checks created it.
     if !local_package_contained_cargo_lock && local_cargo_lock.exists() {
-        std::fs::remove_file(local_cargo_lock)?;
+        fs_err::remove_file(local_cargo_lock)?;
     }
     if !registry_package_contained_cargo_lock && registry_cargo_lock.exists() {
-        std::fs::remove_file(registry_cargo_lock)?;
+        fs_err::remove_file(registry_cargo_lock)?;
     }
     // Delete target dir if cargo-semver-checks created it.
     if !local_package_contained_target && local_target_dir.exists() {
-        std::fs::remove_dir_all(local_target_dir)?;
+        fs_err::remove_dir_all(local_target_dir)?;
     }
     if !registry_package_contained_target && registry_target_dir.exists() {
-        std::fs::remove_dir_all(registry_target_dir)?;
+        fs_err::remove_dir_all(registry_target_dir)?;
     }
 
     if output.status.success() {
@@ -87,9 +84,8 @@ pub fn run_semver_check(
     } else {
         let stderr = String::from_utf8(output.stderr)?;
         if stderr.contains("semver requires new major version") {
-            let stdout =
-                strip_ansi_escapes::strip(output.stdout).context("can't strip ANSI escapes")?;
-            let stdout = String::from_utf8(stdout)?;
+            let stdout = strip_ansi_escapes::strip(output.stdout);
+            let stdout = String::from_utf8(stdout)?.trim().to_string();
             if stdout.is_empty() {
                 anyhow::bail!("unknown source of semver incompatibility");
             }

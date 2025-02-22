@@ -4,19 +4,17 @@ mod cmd;
 #[cfg(feature = "test_fixture")]
 pub mod test_fixture;
 
-use std::{
-    fmt,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{collections::HashSet, path::Path, process::Command};
 
-use anyhow::{anyhow, Context};
-use tracing::{debug, instrument, trace, warn, Span};
+use anyhow::{Context, anyhow};
+use camino::{Utf8Path, Utf8PathBuf};
+use tracing::{Span, debug, instrument, trace, warn};
 
 /// Repository
+#[derive(Debug)]
 pub struct Repo {
     /// Directory where you want to run git operations
-    directory: PathBuf,
+    directory: Utf8PathBuf,
     /// Branch name before running any git operation
     original_branch: String,
     /// Remote name before running any git operation
@@ -26,7 +24,7 @@ pub struct Repo {
 impl Repo {
     /// Returns an error if the directory doesn't contain any commit
     #[instrument(skip_all)]
-    pub fn new(directory: impl AsRef<Path>) -> anyhow::Result<Self> {
+    pub fn new(directory: impl AsRef<Utf8Path>) -> anyhow::Result<Self> {
         debug!("initializing directory {:?}", directory.as_ref());
 
         let (current_remote, current_branch) = Self::get_current_remote_and_branch(&directory)
@@ -39,12 +37,12 @@ impl Repo {
         })
     }
 
-    pub fn directory(&self) -> &Path {
+    pub fn directory(&self) -> &Utf8Path {
         &self.directory
     }
 
     fn get_current_remote_and_branch(
-        directory: impl AsRef<Path>,
+        directory: impl AsRef<Utf8Path>,
     ) -> anyhow::Result<(String, String)> {
         match git_in_dir(
             directory.as_ref(),
@@ -63,7 +61,7 @@ impl Repo {
             Err(e) => {
                 let err = e.to_string();
                 if err.contains("fatal: no upstream configured for branch") {
-                    let branch = Self::get_current_branch(directory)?;
+                    let branch = get_current_branch(directory)?;
                     warn!("no upstream configured for branch {branch}");
                     Ok(("origin".to_string(), branch))
                 } else if err.contains("fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.") {
@@ -75,22 +73,13 @@ impl Repo {
         }
     }
 
-    fn get_current_branch(directory: impl AsRef<Path>) -> anyhow::Result<String> {
-        git_in_dir(directory.as_ref(), &["rev-parse", "--abbrev-ref", "HEAD"])
-        .map_err(|e|
-            if e.to_string().contains("fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.") {
-                anyhow!("git repository does not contain any commit.")
-            }
-            else {
-                e
-            }
-        )
-    }
-
     /// Check if there are uncommitted changes.
     pub fn is_clean(&self) -> anyhow::Result<()> {
         let changes = self.changes_except_typechanges()?;
-        anyhow::ensure!(changes.is_empty(), "the working directory of this project has uncommitted changes. Please commit or stash these changes:\n{changes:?}");
+        anyhow::ensure!(
+            changes.is_empty(),
+            "the working directory of this project has uncommitted changes. If these files are both committed and in .gitignore, either delete them or remove them from .gitignore. Otherwise, please commit or stash these changes:\n{changes:?}"
+        );
         Ok(())
     }
 
@@ -99,16 +88,39 @@ impl Repo {
         Ok(())
     }
 
+    pub fn delete_branch_in_remote(&self, branch: &str) -> anyhow::Result<()> {
+        self.push(&format!(":refs/heads/{branch}"))
+            .with_context(|| format!("can't delete temporary branch {branch}"))
+    }
+
     pub fn add_all_and_commit(&self, message: &str) -> anyhow::Result<()> {
         self.git(&["add", "."])?;
         self.git(&["commit", "-m", message])?;
         Ok(())
     }
 
-    pub fn changes_except_typechanges(&self) -> anyhow::Result<Vec<String>> {
+    /// Get the list of changed files.
+    /// `filter` is applied for each line of `git status --porcelain`.
+    /// Only changes for which `filter` returns true are returned.
+    pub fn changes(&self, filter: impl FnMut(&&str) -> bool) -> anyhow::Result<Vec<String>> {
         let output = self.git(&["status", "--porcelain"])?;
-        let changed_files = changed_files(&output);
+        let changed_files = changed_files(&output, filter);
         Ok(changed_files)
+    }
+
+    /// Get files changed in the current commit
+    pub fn files_of_current_commit(&self) -> anyhow::Result<HashSet<Utf8PathBuf>> {
+        let output = self.git(&["show", "--oneline", "--name-only", "--pretty=format:"])?;
+        let changed_files = output
+            .lines()
+            .map(|l| l.trim())
+            .map(Utf8PathBuf::from)
+            .collect();
+        Ok(changed_files)
+    }
+
+    pub fn changes_except_typechanges(&self) -> anyhow::Result<Vec<String>> {
+        self.changes(|line| !line.starts_with("T "))
     }
 
     pub fn add<T: AsRef<str>>(&self, paths: &[T]) -> anyhow::Result<()> {
@@ -124,6 +136,11 @@ impl Repo {
         Ok(())
     }
 
+    pub fn commit_signed(&self, message: &str) -> anyhow::Result<()> {
+        self.git(&["commit", "-s", "-m", message])?;
+        Ok(())
+    }
+
     pub fn push(&self, obj: &str) -> anyhow::Result<()> {
         self.git(&["push", &self.original_remote, obj])?;
         Ok(())
@@ -135,12 +152,18 @@ impl Repo {
     }
 
     pub fn force_push(&self, obj: &str) -> anyhow::Result<()> {
-        self.git(&["push", &self.original_remote, obj, "--force"])?;
+        // `--force-with-lease` is safer than `--force` because it will not overwrite
+        // changes on the remote that you do not have locally.
+        // In other words, it will only push if no one else has pushed changes to the remote
+        // branch since you last pulled. If someone else has pushed changes, the command will fail,
+        // preventing you from accidentally overwriting someone else's work.
+        self.git(&["push", &self.original_remote, obj, "--force-with-lease"])?;
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub fn checkout_head(&self) -> anyhow::Result<()> {
-        self.git(&["checkout", &self.original_branch])?;
+        self.checkout(&self.original_branch)?;
         Ok(())
     }
 
@@ -189,29 +212,48 @@ impl Repo {
     }
 
     /// Checkout to the latest commit.
-    pub fn checkout_last_commit_at_path(&self, path: &Path) -> anyhow::Result<()> {
-        let previous_commit = self.last_commit_at_path(path)?;
+    pub fn checkout_last_commit_at_paths(&self, paths: &[&Path]) -> anyhow::Result<()> {
+        let previous_commit = self.last_commit_at_paths(paths)?;
         self.checkout(&previous_commit)?;
         Ok(())
     }
 
-    fn last_commit_at_path(&self, path: &Path) -> anyhow::Result<String> {
-        self.nth_commit_at_path(1, path)
+    fn last_commit_at_paths(&self, paths: &[&Path]) -> anyhow::Result<String> {
+        self.nth_commit_at_paths(1, paths)
+            .context("failed to get message of last commit")
     }
 
-    fn previous_commit_at_path(&self, path: &Path) -> anyhow::Result<String> {
-        self.nth_commit_at_path(2, path)
+    fn previous_commit_at_paths(&self, paths: &[&Path]) -> anyhow::Result<String> {
+        self.nth_commit_at_paths(2, paths)
+            .context("failed to get message of previous commit")
     }
 
-    pub fn checkout_previous_commit_at_path(&self, path: &Path) -> anyhow::Result<()> {
-        let commit = self.previous_commit_at_path(path)?;
+    pub fn checkout_previous_commit_at_paths(&self, paths: &[&Path]) -> anyhow::Result<()> {
+        let commit = self.previous_commit_at_paths(paths)?;
         self.checkout(&commit)?;
         Ok(())
     }
 
     #[instrument(skip(self))]
     pub fn checkout(&self, object: &str) -> anyhow::Result<()> {
-        self.git(&["checkout", object])?;
+        self.git(&["checkout", object])
+            .context("failed to checkout")?;
+        Ok(())
+    }
+
+    /// Adds a detached git worktree at the given path checked out at the given object.
+    pub fn add_worktree(&self, path: impl AsRef<str>, object: &str) -> anyhow::Result<()> {
+        self.git(&["worktree", "add", "--detach", path.as_ref(), object])
+            .context("failed to create git worktree")?;
+
+        Ok(())
+    }
+
+    /// Removes a worktree that was created for this repository at the given path.
+    pub fn remove_worktree(&self, path: impl AsRef<str>) -> anyhow::Result<()> {
+        self.git(&["worktree", "remove", path.as_ref()])
+            .context("failed to remove worktree")?;
+
         Ok(())
     }
 
@@ -222,17 +264,19 @@ impl Repo {
             nth_commit = tracing::field::Empty,
         )
     )]
-    fn nth_commit_at_path(
-        &self,
-        nth: usize,
-        path: impl AsRef<Path> + fmt::Debug,
-    ) -> anyhow::Result<String> {
+    fn nth_commit_at_paths(&self, nth: usize, paths: &[&Path]) -> anyhow::Result<String> {
         let nth_str = nth.to_string();
-        let path = path
-            .as_ref()
-            .to_str()
-            .ok_or_else(|| anyhow!("invalid path"))?;
-        let commit_list = self.git(&["log", "--format=%H", "-n", &nth_str, "--", path])?;
+
+        let git_args = {
+            let mut git_args = vec!["log", "--format=%H", "-n", &nth_str, "--"];
+            for p in paths {
+                let path = p.to_str().expect("invalid path");
+                git_args.push(path);
+            }
+            git_args
+        };
+
+        let commit_list = self.git(&git_args)?;
         let mut commits = commit_list.lines();
         let last_commit = commits.nth(nth - 1).context("not enough commits")?;
 
@@ -245,18 +289,53 @@ impl Repo {
         self.git(&["log", "-1", "--pretty=format:%B"])
     }
 
+    pub fn get_author_name(&self, commit_hash: &str) -> anyhow::Result<String> {
+        self.get_commit_info("%an", commit_hash)
+    }
+
+    pub fn get_author_email(&self, commit_hash: &str) -> anyhow::Result<String> {
+        self.get_commit_info("%ae", commit_hash)
+    }
+
+    pub fn get_committer_name(&self, commit_hash: &str) -> anyhow::Result<String> {
+        self.get_commit_info("%cn", commit_hash)
+    }
+
+    pub fn get_committer_email(&self, commit_hash: &str) -> anyhow::Result<String> {
+        self.get_commit_info("%ce", commit_hash)
+    }
+
+    fn get_commit_info(&self, info: &str, commit_hash: &str) -> anyhow::Result<String> {
+        self.git(&["log", "-1", &format!("--pretty=format:{info}"), commit_hash])
+    }
+
+    /// Get the SHA1 of the current HEAD.
     pub fn current_commit_hash(&self) -> anyhow::Result<String> {
         self.git(&["log", "-1", "--pretty=format:%H"])
+            .context("can't determine current commit hash")
     }
 
     /// Create a git tag
-    pub fn tag(&self, name: &str) -> anyhow::Result<String> {
-        self.git(&["tag", name])
+    pub fn tag(&self, name: &str, message: &str) -> anyhow::Result<String> {
+        self.git(&["tag", "-m", message, name])
     }
 
     /// Get the commit hash of the given tag
     pub fn get_tag_commit(&self, tag: &str) -> Option<String> {
         self.git(&["rev-list", "-n", "1", tag]).ok()
+    }
+
+    /// Returns all the tags in the repository in an unspecified order.
+    pub fn get_all_tags(&self) -> Vec<String> {
+        match self
+            .git(&["tag", "--list"])
+            .ok()
+            .as_ref()
+            .map(|output| output.trim())
+        {
+            None | Some("") => vec![],
+            Some(output) => output.lines().map(|line| line.to_owned()).collect(),
+        }
     }
 
     /// Check if a commit comes before another one.
@@ -280,6 +359,11 @@ impl Repo {
         .is_ok()
     }
 
+    /// Name of the remote when the [`Repo`] was created.
+    pub fn original_remote(&self) -> &str {
+        &self.original_remote
+    }
+
     /// Url of the remote when the [`Repo`] was created.
     pub fn original_remote_url(&self) -> anyhow::Result<String> {
         let param = format!("remote.{}.url", self.original_remote);
@@ -292,21 +376,42 @@ impl Repo {
             .context("cannot determine if git tag exists")?;
         Ok(output.lines().count() >= 1)
     }
+
+    pub fn get_branches_of_commit(&self, commit_hash: &str) -> anyhow::Result<Vec<String>> {
+        let output = self.git(&["branch", "--contains", commit_hash])?;
+        let branches = output
+            .lines()
+            .filter_map(|l| l.split_whitespace().last())
+            .map(|s| s.to_string())
+            .collect();
+        Ok(branches)
+    }
 }
 
-fn changed_files(output: &str) -> Vec<String> {
+pub fn is_file_ignored(repo_path: &Utf8Path, file: &Utf8Path) -> bool {
+    let file = file.as_str();
+
+    git_in_dir(repo_path, &["check-ignore", "--no-index", file]).is_ok()
+}
+
+pub fn is_file_committed(repo_path: &Utf8Path, file: &Utf8Path) -> bool {
+    let file = file.as_str();
+    git_in_dir(repo_path, &["ls-files", "--error-unmatch", file]).is_ok()
+}
+
+fn changed_files(output: &str, filter: impl FnMut(&&str) -> bool) -> Vec<String> {
     output
         .lines()
         .map(|l| l.trim())
         // filter typechanges
-        .filter(|l| !l.starts_with("T "))
+        .filter(filter)
         .filter_map(|e| e.rsplit(' ').next())
         .map(|e| e.to_string())
         .collect()
 }
 
 #[instrument]
-pub fn git_in_dir(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+pub fn git_in_dir(dir: &Utf8Path, args: &[&str]) -> anyhow::Result<String> {
     let args: Vec<&str> = args.iter().map(|s| s.trim()).collect();
     let output = Command::new("git")
         .arg("-C")
@@ -321,7 +426,8 @@ pub fn git_in_dir(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     if output.status.success() {
         Ok(stdout)
     } else {
-        let mut error = format!("error while running git with args `{args:?}");
+        let mut error =
+            format!("error while running git in directory `{dir:?}` with args `{args:?}");
         let stderr = cmd::string_from_bytes(output.stderr)?;
         if !stdout.is_empty() || !stderr.is_empty() {
             error.push(':');
@@ -338,9 +444,21 @@ pub fn git_in_dir(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     }
 }
 
+/// Get the name of the current branch.
+fn get_current_branch(directory: impl AsRef<Utf8Path>) -> anyhow::Result<String> {
+    git_in_dir(directory.as_ref(), &["rev-parse", "--abbrev-ref", "HEAD"]).map_err(|e| {
+        if e.to_string().contains(
+            "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.",
+        ) {
+            anyhow!("git repository does not contain any commit.")
+        } else {
+            e
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use tempfile::tempdir;
 
     use super::*;
@@ -350,7 +468,8 @@ mod tests {
         let repository_dir = tempdir().unwrap();
         let repo = Repo::init(&repository_dir);
         let file1 = repository_dir.as_ref().join("file1.txt");
-        repo.checkout_previous_commit_at_path(&file1).unwrap_err();
+        repo.checkout_previous_commit_at_paths(&[&file1])
+            .unwrap_err();
     }
 
     #[test]
@@ -361,14 +480,14 @@ mod tests {
         let file1 = repository_dir.as_ref().join("file1.txt");
         let file2 = repository_dir.as_ref().join("file2.txt");
         {
-            fs::write(&file2, b"Hello, file2!-1").unwrap();
+            fs_err::write(&file2, b"Hello, file2!-1").unwrap();
             repo.add_all_and_commit("file2-1").unwrap();
-            fs::write(file1, b"Hello, file1!").unwrap();
+            fs_err::write(file1, b"Hello, file1!").unwrap();
             repo.add_all_and_commit("file1").unwrap();
-            fs::write(&file2, b"Hello, file2!-2").unwrap();
+            fs_err::write(&file2, b"Hello, file2!-2").unwrap();
             repo.add_all_and_commit("file2-2").unwrap();
         }
-        repo.checkout_previous_commit_at_path(&file2).unwrap();
+        repo.checkout_previous_commit_at_paths(&[&file2]).unwrap();
         assert_eq!(repo.current_commit_message().unwrap(), "file2-1");
     }
 
@@ -379,14 +498,14 @@ mod tests {
         let repo = Repo::init(&repository_dir);
         let file1 = repository_dir.as_ref().join("file1.txt");
 
-        let commit_message = r#"feat: my feature
+        let commit_message = r"feat: my feature
 
         message
 
-        footer: small note"#;
+        footer: small note";
 
         {
-            fs::write(file1, b"Hello, file1!").unwrap();
+            fs_err::write(file1, b"Hello, file1!").unwrap();
             repo.add_all_and_commit(commit_message).unwrap();
         }
         assert_eq!(repo.current_commit_message().unwrap(), commit_message);
@@ -406,22 +525,21 @@ mod tests {
         let repository_dir = tempdir().unwrap();
         let repo = Repo::init(&repository_dir);
         let file1 = repository_dir.as_ref().join("file1.txt");
-        fs::write(file1, b"Hello, file1!").unwrap();
+        fs_err::write(file1, b"Hello, file1!").unwrap();
         assert!(repo.is_clean().is_err());
     }
 
     #[test]
     fn changes_files_except_typechanges_are_detected() {
         let git_status_output = r"T CHANGELOG.md
- M README.md
+M README.md
 A  crates
 D  crates/git_cmd/CHANGELOG.md
 ";
-        let changed_files = changed_files(git_status_output);
-        assert_eq!(
-            changed_files,
-            vec!["README.md", "crates", "crates/git_cmd/CHANGELOG.md",]
-        )
+        let changed_files = changed_files(git_status_output, |line| !line.starts_with("T "));
+        // `CHANGELOG.md` is ignored because it's a typechange
+        let expected_changed_files = vec!["README.md", "crates", "crates/git_cmd/CHANGELOG.md"];
+        assert_eq!(changed_files, expected_changed_files);
     }
 
     #[test]
@@ -431,12 +549,12 @@ D  crates/git_cmd/CHANGELOG.md
         let repo = Repo::init(&repository_dir);
         let file1 = repository_dir.as_ref().join("file1.txt");
         {
-            fs::write(file1, b"Hello, file1!").unwrap();
+            fs_err::write(file1, b"Hello, file1!").unwrap();
             repo.add_all_and_commit("file1").unwrap();
         }
         let version = "v1.0.0";
-        repo.tag(version).unwrap();
-        assert!(repo.tag_exists(version).unwrap())
+        repo.tag(version, "test").unwrap();
+        assert!(repo.tag_exists(version).unwrap());
     }
 
     #[test]
@@ -446,10 +564,36 @@ D  crates/git_cmd/CHANGELOG.md
         let repo = Repo::init(&repository_dir);
         let file1 = repository_dir.as_ref().join("file1.txt");
         {
-            fs::write(file1, b"Hello, file1!").unwrap();
+            fs_err::write(file1, b"Hello, file1!").unwrap();
             repo.add_all_and_commit("file1").unwrap();
         }
-        repo.tag("v1.0.0").unwrap();
-        assert!(!repo.tag_exists("v2.0.0").unwrap())
+        repo.tag("v1.0.0", "test").unwrap();
+        assert!(!repo.tag_exists("v2.0.0").unwrap());
+    }
+
+    #[test]
+    fn tags_are_retrieved() {
+        test_logs::init();
+        let repository_dir = tempdir().unwrap();
+        let repo = Repo::init(&repository_dir);
+        repo.tag("v1.0.0", "test").unwrap();
+        let file1 = repository_dir.as_ref().join("file1.txt");
+        {
+            fs_err::write(file1, b"Hello, file1!").unwrap();
+            repo.add_all_and_commit("file1").unwrap();
+        }
+        repo.tag("v1.0.1", "test2").unwrap();
+        let tags = repo.get_all_tags();
+        assert_eq!(tags, vec!["v1.0.0", "v1.0.1"]);
+    }
+
+    #[test]
+    fn is_branch_of_commit_detected_correctly() {
+        test_logs::init();
+        let repository_dir = tempdir().unwrap();
+        let repo = Repo::init(&repository_dir);
+        let commit_hash = repo.current_commit_hash().unwrap();
+        let branches = repo.get_branches_of_commit(&commit_hash).unwrap();
+        assert_eq!(branches, vec![repo.original_branch()]);
     }
 }

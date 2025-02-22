@@ -1,29 +1,31 @@
-use anyhow::Context;
-use cargo_metadata::Package;
-use std::path::Path;
+use std::collections::BTreeSet;
+
+use cargo_metadata::{Metadata, Package, camino::Utf8Path};
+
+pub fn get_manifest_metadata(
+    manifest_path: &Utf8Path,
+) -> Result<cargo_metadata::Metadata, cargo_metadata::Error> {
+    cargo_metadata::MetadataCommand::new()
+        .no_deps()
+        .manifest_path(manifest_path)
+        .exec()
+}
 
 /// Lookup all members of the current workspace
-pub fn workspace_members(manifest_path: Option<&Path>) -> anyhow::Result<Vec<Package>> {
-    let mut cmd = cargo_metadata::MetadataCommand::new();
-    cmd.no_deps();
-    if let Some(manifest_path) = manifest_path {
-        cmd.manifest_path(manifest_path);
-    }
-    let result = cmd.exec().with_context(|| "Invalid manifest")?;
-    let workspace_members: std::collections::BTreeSet<_> =
-        result.workspace_members.into_iter().collect();
-    let workspace_members: Vec<_> = result
+pub fn workspace_members(metadata: &Metadata) -> anyhow::Result<impl Iterator<Item = Package>> {
+    let workspace_members: BTreeSet<_> = metadata.workspace_members.clone().into_iter().collect();
+    let workspace_members = metadata
         .packages
+        .clone()
         .into_iter()
-        .filter(|p| workspace_members.contains(&p.id))
+        .filter(move |p| workspace_members.contains(&p.id))
         .map(|mut p| {
             p.manifest_path = canonicalize_path(p.manifest_path);
-            for dep in p.dependencies.iter_mut() {
+            for dep in &mut p.dependencies {
                 dep.path = dep.path.take().map(canonicalize_path);
             }
             p
-        })
-        .collect();
+        });
     Ok(workspace_members)
 }
 

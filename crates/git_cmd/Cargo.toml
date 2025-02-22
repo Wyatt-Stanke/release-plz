@@ -1,21 +1,26 @@
 [package]
 name = "git_cmd"
-version = "0.4.6"
-edition = "2021"
+version = "0.6.21"
+edition.workspace = true
 description = "Wrapper around git cli"
-repository = "https://github.com/MarcoIeni/release-plz/tree/main/crates/git_cmd"
-license = "MIT OR Apache-2.0"
+repository = "https://github.com/release-plz/release-plz/tree/main/crates/git_cmd"
+license.workspace = true
 keywords = ["git", "command", "cli", "wrapper", "shell"]
 categories = ["development-tools", "filesystem"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lints]
+workspace = true
 
 [features]
 test_fixture = []
 
 [dependencies]
 anyhow.workspace = true
+camino.workspace = true
 tracing.workspace = true
+fs-err.workspace = true
 
 [dev-dependencies]
 git_cmd = { path = ".", features = ["test_fixture"]}

@@ -1,11 +1,21 @@
 // Copied from [cargo-clone](https://github.com/JanLikar/cargo-clone/blob/89ba4da215663ffb3b8c93a674f3002937eafec4/cargo-clone-core/src/source.rs)
 
-use cargo::{core::SourceId, CargoResult, Config};
+use cargo::{CargoResult, GlobalContext, core::SourceId};
+use std::fmt;
 
 /// Where to clone the crate from.
 #[derive(Debug, Default, Clone)]
 pub struct ClonerSource {
     pub(crate) cargo_source: CargoSource,
+}
+
+impl fmt::Display for CargoSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CargoSource::CratesIo => write!(f, "crates.io"),
+            CargoSource::Registry(key) => write!(f, "{key}"),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -32,7 +42,7 @@ impl ClonerSource {
 }
 
 impl CargoSource {
-    pub(crate) fn to_source_id(&self, config: &Config) -> CargoResult<SourceId> {
+    pub(crate) fn to_source_id(&self, config: &GlobalContext) -> CargoResult<SourceId> {
         match self {
             CargoSource::CratesIo => SourceId::crates_io(config),
             CargoSource::Registry(key) => SourceId::alt_registry(config, key),
